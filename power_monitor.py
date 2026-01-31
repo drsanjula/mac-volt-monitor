@@ -66,9 +66,10 @@ class DataCollector(threading.Thread):
         self.running = True
         self.last_slow_check = 0
 
-    def run_command(self, cmd):
+    def run_command(self, cmd_args):
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            # Security: Use shell=False and pass arguments as a list
+            result = subprocess.run(cmd_args, capture_output=True, text=True, timeout=5, shell=False)
             return result.stdout
         except Exception:
             return ""
@@ -79,7 +80,7 @@ class DataCollector(threading.Thread):
             
             # 1. Collect Data - Consolidate to ONE fast shell call if possible
             # ioreg -w0 -rn AppleSmartBattery contains 95% of what we need
-            ioreg_out = self.run_command("ioreg -w0 -rn AppleSmartBattery 2>/dev/null")
+            ioreg_out = self.run_command(["ioreg", "-w0", "-rn", "AppleSmartBattery"])
             
             # 2. Parse under lock
             with self.lock:
@@ -154,12 +155,17 @@ class DataCollector(threading.Thread):
 
             # 3. Slow check for Condition & Low Power Mode (every 30s)
             if time.time() - self.last_slow_check > 30:
-                prof_out = self.run_command("system_profiler SPPowerDataType | grep Condition")
+                prof_out = self.run_command(["system_profiler", "SPPowerDataType"])
                 match = re.search(r'Condition:\s*(\w+)', prof_out)
-                lpm_out = self.run_command("pmset -g | grep lowpowermode")
+                
+                # Check low power mode via pmset
+                lpm_out = self.run_command(["pmset", "-g"])
+                
                 with self.lock:
                     if match: self.data.condition = match.group(1)
-                    self.data.low_power_mode = '1' in lpm_out
+                    # Look for lowpowermode line
+                    lpm_match = re.search(r'lowpowermode\s+(\d)', lpm_out)
+                    self.data.low_power_mode = (lpm_match.group(1) == '1') if lpm_match else False
                 self.last_slow_check = time.time()
 
             time.sleep(self.data.poll_interval)
