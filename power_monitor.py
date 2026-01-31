@@ -43,6 +43,10 @@ class PowerData:
         self.design_capacity = 0
         self.current_capacity = 0
         
+        # Power Mode: PERFORMANCE (0.5s), BALANCED (2s), ECO (5s)
+        self.mode = "BALANCED"
+        self.poll_interval = 2.0
+        
         # History for graphs
         self.power_history = deque(maxlen=100)
         self.temp_history = deque(maxlen=100)
@@ -73,38 +77,37 @@ class DataCollector(threading.Thread):
         while self.running:
             start_time = time.time()
             
-            # 1. Collect Fast Data (pmset & ioreg)
-            # pmset for basic source and time remaining
-            pmset_out = self.run_command("pmset -g batt")
-            # ioreg for all detailed metrics - use -w0 to prevent truncation
+            # 1. Collect Data - Consolidate to ONE fast shell call if possible
+            # ioreg -w0 -rn AppleSmartBattery contains 95% of what we need
             ioreg_out = self.run_command("ioreg -w0 -rn AppleSmartBattery 2>/dev/null")
-            # pmset for low power mode
-            lpm_out = self.run_command("pmset -g | grep lowpowermode")
-
+            
             # 2. Parse under lock
             with self.lock:
-                # PMSET Parsing
-                if 'AC Power' in pmset_out: self.data.power_source = 'AC Power'
-                elif 'Battery Power' in pmset_out: self.data.power_source = 'Battery'
+                # Basic Source & Connection
+                ext_conn = '"ExternalConnected" = Yes' in ioreg_out or '"AppleRawExternalConnected" = Yes' in ioreg_out
+                self.data.power_source = 'AC Power' if ext_conn else 'Battery'
+                self.data.charger_connected = ext_conn
                 
-                match = re.search(r'(\d+)%', pmset_out)
-                if match: self.data.battery_percent = int(match.group(1))
+                # Percentage
+                cur_cap = re.search(r'"CurrentCapacity"\s*=\s*(\d+)', ioreg_out)
+                max_cap = re.search(r'"MaxCapacity"\s*=\s*(\d+)', ioreg_out)
+                if cur_cap and max_cap:
+                    self.data.battery_percent = int(cur_cap.group(1))
                 
-                low_out = pmset_out.lower()
-                if 'charging' in low_out:
-                    self.data.charging_status = 'Not Charging' if 'not charging' in low_out else 'Charging'
-                    if 'finishing charge' in low_out: self.data.charging_status = 'Finishing'
-                elif 'charged' in low_out:
-                    self.data.charging_status = 'Fully Charged'
-                elif 'ac attached' in low_out:
-                    self.data.charging_status = 'Connected'
-                else:
-                    self.data.charging_status = 'Discharging'
+                # Charging Status
+                is_charging = '"IsCharging" = Yes' in ioreg_out
+                fully_charged = '"FullyCharged" = Yes' in ioreg_out
+                if fully_charged: self.data.charging_status = 'Fully Charged'
+                elif is_charging: self.data.charging_status = 'Charging'
+                else: self.data.charging_status = 'Discharging' if not ext_conn else 'Connected'
 
-                t_match = re.search(r'(\d+:\d+)', pmset_out)
-                self.data.time_remaining = t_match.group(1) if t_match else "Calculating..."
+                # Time Remaining
+                t_match = re.search(r'"TimeRemaining"\s*=\s*(\d+)', ioreg_out)
+                if t_match:
+                    mins = int(t_match.group(1))
+                    if mins == 65535: self.data.time_remaining = "Calculating..."
+                    else: self.data.time_remaining = f"{mins // 60}h {mins % 60}m"
                 
-                # IOREG Parsing
                 # Temperature (deciKelvin)
                 match = re.search(r'"Temperature"\s*=\s*(\d+)', ioreg_out)
                 if match: self.data.temperature = round((int(match.group(1)) / 10) - 273.15, 1)
@@ -113,7 +116,6 @@ class DataCollector(threading.Thread):
                 v_match = re.search(r'"Voltage"\s*=\s*(\d+)', ioreg_out)
                 if v_match: self.data.voltage = int(v_match.group(1)) / 1000
                 
-                # Get both Amperage and InstantAmperage, prefer Instant
                 a_match = re.search(r'"InstantAmperage"\s*=\s*(-?\d+)', ioreg_out)
                 if not a_match: a_match = re.search(r'"Amperage"\s*=\s*(-?\d+)', ioreg_out)
                 
@@ -128,49 +130,39 @@ class DataCollector(threading.Thread):
                 # Health & Cycles
                 match = re.search(r'"CycleCount"\s*=\s*(\d+)', ioreg_out)
                 if match: self.data.cycle_count = int(match.group(1))
-                match = re.search(r'"MaxCapacity"\s*=\s*(\d+)', ioreg_out)
-                if match: self.data.max_capacity_percent = int(match.group(1))
                 match = re.search(r'"DesignCapacity"\s*=\s*(\d+)', ioreg_out)
                 if match: self.data.design_capacity = int(match.group(1))
                 match = re.search(r'"AppleRawMaxCapacity"\s*=\s*(\d+)', ioreg_out)
-                if match: self.data.current_capacity = int(match.group(1))
+                if match: 
+                    self.data.current_capacity = int(match.group(1))
+                    if self.data.design_capacity > 0:
+                        self.data.max_capacity_percent = round((self.data.current_capacity / self.data.design_capacity) * 100, 1)
 
-                # Charger Details - Try both AdapterDetails and AppleRawAdapterDetails
-                self.data.charger_connected = '"AppleRawExternalConnected" = Yes' in ioreg_out or '"ExternalConnected" = Yes' in ioreg_out
-                
+                # Charger Details
                 ad_match = re.search(r'"(?:AppleRaw)?AdapterDetails"\s*=\s*\{([^}]+)\}', ioreg_out)
                 if ad_match:
                     ad_str = ad_match.group(1)
-                    # More specific regex to avoid sub-structure matches
-                    # Looks for keys like "Current"=3250 or Current=3250
                     v_match = re.search(r'[ ,]\"?AdapterVoltage\"?[:=](\d+)', " " + ad_str)
                     if v_match: self.data.adapter_voltage = int(v_match.group(1)) / 1000
-                    
                     c_match = re.search(r'[ ,]\"?Current\"?[:=](\d+)', " " + ad_str)
                     if c_match: self.data.adapter_current = int(c_match.group(1))
-
                     w_match = re.search(r'[ ,]\"?Watts\"?[:=](\d+)', " " + ad_str)
                     if w_match: self.data.charger_wattage = int(w_match.group(1))
 
-                
-                # Low Power Mode
-                self.data.low_power_mode = '1' in lpm_out
-                
                 # Update metadata
-                self.data.last_update_time = time.time()
                 self.data.poll_latency = round((time.time() - start_time) * 1000, 0)
 
-            # 3. Slow check for Battery Condition (every 30s)
+            # 3. Slow check for Condition & Low Power Mode (every 30s)
             if time.time() - self.last_slow_check > 30:
                 prof_out = self.run_command("system_profiler SPPowerDataType | grep Condition")
                 match = re.search(r'Condition:\s*(\w+)', prof_out)
-                if match:
-                    with self.lock:
-                        self.data.condition = match.group(1)
+                lpm_out = self.run_command("pmset -g | grep lowpowermode")
+                with self.lock:
+                    if match: self.data.condition = match.group(1)
+                    self.data.low_power_mode = '1' in lpm_out
                 self.last_slow_check = time.time()
 
-            # Sleep briefly between polls to avoid high CPU usage
-            time.sleep(0.5)
+            time.sleep(self.data.poll_interval)
 
 
 def draw_battery_bar(win, y, x, percent, width=30):
@@ -233,6 +225,18 @@ def main_loop(stdscr):
         if key == ord('q') or key == ord('Q'):
             collector.running = False
             break
+        elif key == ord('e') or key == ord('E'):
+            with lock:
+                data.mode = "ECO"
+                data.poll_interval = 5.0
+        elif key == ord('b') or key == ord('B'):
+            with lock:
+                data.mode = "BALANCED"
+                data.poll_interval = 2.0
+        elif key == ord('p') or key == ord('P'):
+            with lock:
+                data.mode = "PERFORMANCE"
+                data.poll_interval = 0.5
             
         max_y, max_x = stdscr.getmaxyx()
         if max_x < 70 or max_y < 25:
@@ -242,12 +246,12 @@ def main_loop(stdscr):
             continue
 
         with lock:
-            # Copy data for rendering to release lock quickly
-            # (In this simple app, we can just work under lock for a moment)
             stdscr.clear()
             
             # Header
-            stdscr.addstr(0, (max_x - 22) // 2, "⚡ MAC POWER MONITOR ⚡", curses.color_pair(4) | curses.A_BOLD)
+            stdscr.addstr(0, (max_x - 35) // 2, "⚡ MAC VOLT MONITOR ⚡", curses.color_pair(4) | curses.A_BOLD)
+            mode_color = curses.color_pair(2) if data.mode == "ECO" else (curses.color_pair(3) if data.mode == "BALANCED" else curses.color_pair(1))
+            stdscr.addstr(1, (max_x - 20) // 2, f"Mode: {data.mode}", mode_color | curses.A_BOLD)
             
             # --- POWER SOURCE ---
             draw_box(stdscr, 2, 2, 6, 66, "⚡ POWER SOURCE")
@@ -312,8 +316,11 @@ def main_loop(stdscr):
                         stdscr.addstr(26, 4 + i, chars[c_idx], curses.color_pair(4))
 
             # Footer
-            footer = f" Last Update: {datetime.now().strftime('%H:%M:%S')} | Poll: {data.poll_latency}ms | 'q' to quit "
-            stdscr.addstr(max_y-1, (max_x - len(footer)) // 2, footer, curses.color_pair(8))
+            footer = f" [P]erf | [B]alanced | [E]co | 'q' to quit  "
+            stdscr.addstr(max_y-2, (max_x - len(footer)) // 2, footer, curses.color_pair(5))
+            
+            meta = f" Poll: {data.poll_latency}ms | Interval: {data.poll_interval}s "
+            stdscr.addstr(max_y-1, (max_x - len(meta)) // 2, meta, curses.color_pair(8))
 
         stdscr.refresh()
         frame += 1
